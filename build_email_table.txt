@@ -1,0 +1,422 @@
+# ============================================================
+# Export ECM mailbox messages from Microsoft Graph to JSON
+# AND load into SQL Server by OVERWRITING the target table:
+#   - If table exists: DROP + CREATE
+#   - If table missing: CREATE
+# Then bulk load all JSON rows (duplicates allowed bc same email topic can be discussed many time).
+#
+# SQL Target:
+#   Server : RPTPRODDB
+#   DB     : Alliance_RPT
+#   Schema : DataScience
+#   Table  : ecm_mailbox
+# ============================================================
+# Sent to Evan P for automated scheduled runs to produce 
+# ecm email data to SQL table (Alliance_RPT.DataScience.ecm_mailbox)) on 12/23/2025
+
+$ErrorActionPreference = "Stop"
+
+# ----------------------------
+# GRAPH CONNECT
+# ----------------------------
+$TenantName = "ccahallianceorg.onmicrosoft.com"
+$TenantID = "<tenant id>"
+$ClientID = "<client id>"
+$CertThumbPrint = "<cert thumb print>"
+$Certificate = Get-ChildItem Cert:\CurrentUser\My\$CertThumbPrint
+$userId = "ECMAuths@thealliance.health"
+Connect-MgGraph -ClientId $ClientID -TenantId $TenantID -Certificate $Certificate -ErrorAction Stop
+
+
+
+$cutoffUtc = (Get-Date).AddDays(-720).ToUniversalTime()
+$cutoffIso = $cutoffUtc.ToString("o")
+Write-Host "Cutoff (UTC): $cutoffIso"
+
+$select = "id,conversationId,subject,from,sender,toRecipients,ccRecipients,sentDateTime,receivedDateTime,bodyPreview"
+
+function Get-AllGraphItems {
+    param([Parameter(Mandatory=$true)][string]$InitialUri)
+
+    $items = New-Object System.Collections.Generic.List[object]
+    $uri = $InitialUri
+    $headers = @{ "Prefer" = "odata.maxpagesize=999" }
+
+    while ($uri) {
+        $resp = Invoke-MgGraphRequest -Method GET -Uri $uri -Headers $headers
+        if ($resp.value) {
+            foreach ($v in $resp.value) { [void]$items.Add($v) }
+        }
+        $uri = $resp.'@odata.nextLink'
+    }
+    return $items
+}
+
+function New-MessagesUri {
+    param(
+        [Parameter(Mandatory=$true)][string]$UserId,
+        [Parameter(Mandatory=$true)][string]$FolderId,
+        [Parameter(Mandatory=$true)][string]$Filter,
+        [Parameter(Mandatory=$true)][string]$Select
+    )
+
+    $base = "https://graph.microsoft.com/v1.0/users/$UserId/mailFolders/$FolderId/messages"
+    $filterEsc = [uri]::EscapeDataString($Filter)
+    $selectEsc = [uri]::EscapeDataString($Select)
+    return "${base}?`$filter=$filterEsc&`$select=$selectEsc&`$top=999"
+}
+
+# Inbox
+$inboxUri  = New-MessagesUri -UserId $userId -FolderId "Inbox" -Filter ("receivedDateTime ge $cutoffIso") -Select $select
+$inboxMsgs = Get-AllGraphItems -InitialUri $inboxUri
+$inboxMsgs | ForEach-Object { $_ | Add-Member -NotePropertyName folderName -NotePropertyValue "Inbox" -Force }
+Write-Host ("Inbox messages returned: {0}" -f $inboxMsgs.Count)
+
+# SentItems
+$sentUri  = New-MessagesUri -UserId $userId -FolderId "SentItems" -Filter ("sentDateTime ge $cutoffIso") -Select $select
+$sentMsgs = Get-AllGraphItems -InitialUri $sentUri
+$sentMsgs | ForEach-Object { $_ | Add-Member -NotePropertyName folderName -NotePropertyValue "SentItems" -Force }
+Write-Host ("SentItems messages returned: {0}" -f $sentMsgs.Count)
+
+# Combine + export
+$allMsgs = @()
+if ($inboxMsgs) { $allMsgs += $inboxMsgs }
+if ($sentMsgs)  { $allMsgs += $sentMsgs  }
+Write-Host ("TOTAL messages returned: {0}" -f $allMsgs.Count)
+
+$outPath = "C:\Users\shiraoka\Analytics\ECM_Mailbox\ecm_mail.json"
+$allMsgs | ConvertTo-Json -Depth 8 | Out-File -FilePath $outPath -Encoding utf8
+Write-Host "Exported JSON to: $outPath"
+
+
+# ============================================================
+# SQL LOAD SECTION (OVERWRITE TABLE)
+# ============================================================
+
+$SqlServer   = "RPTPRODDB"
+$SqlDatabase = "Alliance_RPT"
+$SqlSchema   = "DataScience"
+$SqlTable    = "ecm_mailbox"
+
+$ConnectionString = "Server=$SqlServer;Database=$SqlDatabase;Integrated Security=True;TrustServerCertificate=True;"
+
+# message_id observed max length is 152; set safe headroom
+$MessageIdNVarChar = 256
+
+# Batch metadata for this run (kept even though we overwrite)
+$ExportBatchId = [guid]::NewGuid()
+$ExportedUtc   = [datetime]::UtcNow
+Write-Host "ExportBatchId: $ExportBatchId"
+Write-Host ("ExportedUtc:   {0:o}" -f $ExportedUtc)
+
+function Invoke-SqlNonQuery {
+    param(
+        [Parameter(Mandatory=$true)][string]$ConnectionString,
+        [Parameter(Mandatory=$true)][string]$Sql
+    )
+
+    $conn = New-Object System.Data.SqlClient.SqlConnection($ConnectionString)
+    try {
+        $conn.Open()
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandTimeout = 0
+        $cmd.CommandText = $Sql
+        [void]$cmd.ExecuteNonQuery()
+    }
+    finally {
+        if ($conn.State -ne 'Closed') { $conn.Close() }
+        $conn.Dispose()
+    }
+}
+
+function Write-DataTableBulk {
+    param(
+        [Parameter(Mandatory=$true)][string]$ConnectionString,
+        [Parameter(Mandatory=$true)][System.Data.DataTable]$DataTable,
+        [Parameter(Mandatory=$true)][string]$DestinationTable
+    )
+
+    $conn = New-Object System.Data.SqlClient.SqlConnection($ConnectionString)
+    try {
+        $conn.Open()
+        $bulk = New-Object System.Data.SqlClient.SqlBulkCopy($conn)
+        $bulk.DestinationTableName = $DestinationTable
+        $bulk.BatchSize = 5000
+        $bulk.BulkCopyTimeout = 0
+
+        foreach ($col in $DataTable.Columns) {
+            [void]$bulk.ColumnMappings.Add($col.ColumnName, $col.ColumnName)
+        }
+
+        $bulk.WriteToServer($DataTable)
+        $bulk.Close()
+    }
+    finally {
+        if ($conn.State -ne 'Closed') { $conn.Close() }
+        $conn.Dispose()
+    }
+}
+
+function Trunc {
+    param([string]$s, [int]$max)
+    if ($null -eq $s) { return $null }
+    if ($s.Length -le $max) { return $s }
+    return $s.Substring(0, $max)
+}
+
+function Try-ParseGraphDateTime {
+    param([object]$Value)
+    if ($null -eq $Value) { return $null }
+    $s = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+    try { return [datetimeoffset]::Parse($s).UtcDateTime } catch { return $null }
+}
+
+function Convert-GraphMessageToSqlRow {
+    param(
+        [Parameter(Mandatory=$true)][psobject]$Msg,
+        [Parameter(Mandatory=$true)][guid]$BatchId,
+        [Parameter(Mandatory=$true)][datetime]$ExportedUtc
+    )
+
+    $fromName = $null; $fromAddress = $null
+    if ($Msg.from -and $Msg.from.emailAddress) {
+        $fromName = $Msg.from.emailAddress.name
+        $fromAddress = $Msg.from.emailAddress.address
+    }
+
+    $senderName = $null; $senderAddress = $null
+    if ($Msg.sender -and $Msg.sender.emailAddress) {
+        $senderName = $Msg.sender.emailAddress.name
+        $senderAddress = $Msg.sender.emailAddress.address
+    }
+
+    $toJson = $null
+    if ($Msg.toRecipients) { $toJson = ($Msg.toRecipients | ConvertTo-Json -Depth 6 -Compress) }
+
+    $ccJson = $null
+    if ($Msg.ccRecipients) { $ccJson = ($Msg.ccRecipients | ConvertTo-Json -Depth 6 -Compress) }
+
+    [pscustomobject]@{
+        export_batch_id    = $BatchId
+        exported_utc       = $ExportedUtc
+
+        message_id         = [string]$Msg.id          # duplicates allowed, no truncation
+        conversation_id    = Trunc -s ([string]$Msg.conversationId) -max 128
+        folder_name        = Trunc -s ([string]$Msg.folderName)     -max 50
+        subject            = Trunc -s ([string]$Msg.subject)        -max 998
+
+        from_name          = Trunc -s ([string]$fromName)           -max 256
+        from_address       = Trunc -s ([string]$fromAddress)        -max 320
+
+        sender_name        = Trunc -s ([string]$senderName)         -max 256
+        sender_address     = Trunc -s ([string]$senderAddress)      -max 320
+
+        to_recipients_json = [string]$toJson
+        cc_recipients_json = [string]$ccJson
+
+        sent_datetime      = Try-ParseGraphDateTime -Value $Msg.sentDateTime
+        received_datetime  = Try-ParseGraphDateTime -Value $Msg.receivedDateTime
+
+        body_preview       = [string]$Msg.bodyPreview
+    }
+}
+
+# ----------------------------
+# Read JSON (source of truth for SQL load)
+# ----------------------------
+if (-not (Test-Path -LiteralPath $outPath)) { throw "JSON file not found at: $outPath" }
+Write-Host "Reading JSON from: $outPath"
+$jsonRaw = Get-Content -LiteralPath $outPath -Raw -Encoding utf8
+$parsed = $jsonRaw | ConvertFrom-Json
+if ($null -eq $parsed) { throw "Parsed JSON is null: $outPath" }
+
+$parsedMsgs = @($parsed)
+Write-Host ("JSON messages loaded: {0}" -f $parsedMsgs.Count)
+
+# ----------------------------
+# OVERWRITE target table
+# ----------------------------
+$fullTarget = "[$SqlSchema].[$SqlTable]"
+$fullStaging = "[$SqlSchema].[ecm_mailbox_staging]"
+
+$overwriteSql = @"
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'$SqlSchema')
+BEGIN
+    EXEC(N'CREATE SCHEMA [$SqlSchema]');
+END;
+
+-- Drop staging if it exists (safety)
+IF OBJECT_ID(N'$fullStaging', N'U') IS NOT NULL
+BEGIN
+    DROP TABLE $fullStaging;
+END;
+
+-- Drop target if it exists (OVERWRITE behavior)
+IF OBJECT_ID(N'$fullTarget', N'U') IS NOT NULL
+BEGIN
+    DROP TABLE $fullTarget;
+END;
+
+-- Create target (append-only shape; duplicates allowed)
+CREATE TABLE $fullTarget (
+    row_id              bigint IDENTITY(1,1) NOT NULL CONSTRAINT PK_${SqlSchema}_${SqlTable}_row_id PRIMARY KEY,
+    export_batch_id     uniqueidentifier NOT NULL,
+    exported_utc        datetime2(7) NOT NULL,
+    loaded_utc          datetime2(7) NOT NULL CONSTRAINT DF_${SqlSchema}_${SqlTable}_loaded_utc DEFAULT (sysutcdatetime()),
+
+    message_id          nvarchar($MessageIdNVarChar) NOT NULL,
+    conversation_id     nvarchar(128)  NULL,
+    folder_name         nvarchar(50)   NULL,
+    subject             nvarchar(998)  NULL,
+
+    from_name           nvarchar(256)  NULL,
+    from_address        nvarchar(320)  NULL,
+
+    sender_name         nvarchar(256)  NULL,
+    sender_address      nvarchar(320)  NULL,
+
+    to_recipients_json  nvarchar(max)  NULL,
+    cc_recipients_json  nvarchar(max)  NULL,
+
+    sent_datetime       datetime2(7)   NULL,
+    received_datetime   datetime2(7)   NULL,
+
+    body_preview        nvarchar(max)  NULL
+);
+
+CREATE INDEX IX_${SqlSchema}_${SqlTable}_message_id ON $fullTarget(message_id);
+CREATE INDEX IX_${SqlSchema}_${SqlTable}_batch ON $fullTarget(export_batch_id);
+"@
+
+Invoke-SqlNonQuery -ConnectionString $ConnectionString -Sql $overwriteSql
+Write-Host "Target table overwritten (dropped/created)."
+
+# ----------------------------
+# Transform -> DataTable (NO DEDUPE)
+# ----------------------------
+$rows = foreach ($m in $parsedMsgs) {
+    Convert-GraphMessageToSqlRow -Msg $m -BatchId $ExportBatchId -ExportedUtc $ExportedUtc
+}
+
+$dt = New-Object System.Data.DataTable
+[void]$dt.Columns.Add("export_batch_id",    [guid])
+[void]$dt.Columns.Add("exported_utc",       [datetime])
+
+[void]$dt.Columns.Add("message_id",         [string])
+[void]$dt.Columns.Add("conversation_id",    [string])
+[void]$dt.Columns.Add("folder_name",        [string])
+[void]$dt.Columns.Add("subject",            [string])
+
+[void]$dt.Columns.Add("from_name",          [string])
+[void]$dt.Columns.Add("from_address",       [string])
+
+[void]$dt.Columns.Add("sender_name",        [string])
+[void]$dt.Columns.Add("sender_address",     [string])
+
+[void]$dt.Columns.Add("to_recipients_json", [string])
+[void]$dt.Columns.Add("cc_recipients_json", [string])
+
+[void]$dt.Columns.Add("sent_datetime",      [datetime])
+[void]$dt.Columns.Add("received_datetime",  [datetime])
+
+[void]$dt.Columns.Add("body_preview",       [string])
+
+foreach ($r in $rows) {
+    # allow duplicates, but require message_id present
+    if (-not $r.message_id) { continue }
+
+    $dr = $dt.NewRow()
+    $dr["export_batch_id"]    = $r.export_batch_id
+    $dr["exported_utc"]       = $r.exported_utc
+
+    $dr["message_id"]         = $r.message_id
+    $dr["conversation_id"]    = $r.conversation_id
+    $dr["folder_name"]        = $r.folder_name
+    $dr["subject"]            = $r.subject
+
+    $dr["from_name"]          = $r.from_name
+    $dr["from_address"]       = $r.from_address
+
+    $dr["sender_name"]        = $r.sender_name
+    $dr["sender_address"]     = $r.sender_address
+
+    $dr["to_recipients_json"] = $r.to_recipients_json
+    $dr["cc_recipients_json"] = $r.cc_recipients_json
+
+    if ($null -ne $r.sent_datetime)     { $dr["sent_datetime"] = $r.sent_datetime }     else { $dr["sent_datetime"] = [DBNull]::Value }
+    if ($null -ne $r.received_datetime) { $dr["received_datetime"] = $r.received_datetime } else { $dr["received_datetime"] = [DBNull]::Value }
+
+    $dr["body_preview"]       = $r.body_preview
+
+    [void]$dt.Rows.Add($dr)
+}
+
+Write-Host ("Prepared rows for SQL (duplicates allowed): {0}" -f $dt.Rows.Count)
+if ($dt.Rows.Count -eq 0) { throw "No rows to load after transform." }
+
+# ----------------------------
+# Create staging -> bulk copy -> insert -> drop staging
+# ----------------------------
+$stageSql = @"
+CREATE TABLE $fullStaging (
+    export_batch_id     uniqueidentifier NOT NULL,
+    exported_utc        datetime2(7) NOT NULL,
+
+    message_id          nvarchar($MessageIdNVarChar) NOT NULL,
+    conversation_id     nvarchar(128)  NULL,
+    folder_name         nvarchar(50)   NULL,
+    subject             nvarchar(998)  NULL,
+
+    from_name           nvarchar(256)  NULL,
+    from_address        nvarchar(320)  NULL,
+
+    sender_name         nvarchar(256)  NULL,
+    sender_address      nvarchar(320)  NULL,
+
+    to_recipients_json  nvarchar(max)  NULL,
+    cc_recipients_json  nvarchar(max)  NULL,
+
+    sent_datetime       datetime2(7)   NULL,
+    received_datetime   datetime2(7)   NULL,
+
+    body_preview        nvarchar(max)  NULL
+);
+"@
+Invoke-SqlNonQuery -ConnectionString $ConnectionString -Sql $stageSql
+Write-Host "Staging table created."
+
+Write-DataTableBulk -ConnectionString $ConnectionString -DataTable $dt -DestinationTable $fullStaging
+Write-Host "Bulk copy into staging complete."
+
+$insertSql = @"
+INSERT INTO $fullTarget
+(
+    export_batch_id, exported_utc,
+    message_id,
+    conversation_id, folder_name, subject,
+    from_name, from_address,
+    sender_name, sender_address,
+    to_recipients_json, cc_recipients_json,
+    sent_datetime, received_datetime,
+    body_preview
+)
+SELECT
+    export_batch_id, exported_utc,
+    message_id,
+    conversation_id, folder_name, subject,
+    from_name, from_address,
+    sender_name, sender_address,
+    to_recipients_json, cc_recipients_json,
+    sent_datetime, received_datetime,
+    body_preview
+FROM $fullStaging;
+"@
+Invoke-SqlNonQuery -ConnectionString $ConnectionString -Sql $insertSql
+Write-Host "Inserted staging rows into target."
+
+$dropStageSql = "DROP TABLE $fullStaging;"
+Invoke-SqlNonQuery -ConnectionString $ConnectionString -Sql $dropStageSql
+Write-Host "Staging table dropped. Done."
+
+Write-Host "Validation (SSMS): SELECT COUNT(*) FROM DataScience.ecm_mailbox;"
